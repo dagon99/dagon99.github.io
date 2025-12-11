@@ -8,6 +8,95 @@ date: 2025-12-11
 
 ItyFuzz is a feedback-driven fuzzer for smart contract VMs (primarily EVM) built on top of LibAFL. Instead of fuzzing traditional programs, ItyFuzz fuzzes **EVM transactions** to discover vulnerabilities in smart contracts. The key innovation is using **VM-level coverage** (jump/branch coverage within the VM execution) rather than program instruction coverage, combined with specialized feedback mechanisms for smart contract vulnerability detection.
 
+## Snapshot-Based Fuzzing
+
+ItyFuzz introduces several key innovations that enable efficient fuzzing of stateful smart contracts, particularly for on-chain testing scenarios. These innovations are detailed in the research paper: [ItyFuzz: Snapshot-Based Fuzzer for Smart Contract](https://arxiv.org/pdf/2306.17135) (ISSTA '23).
+
+### The Problem with Traditional Stateful Fuzzing
+
+Smart contracts are **stateful programs** where each transaction modifies the blockchain state. Traditional fuzzers for smart contracts face significant challenges:
+
+1. **Re-execution Overhead**: Existing tools start from a fresh state for each fuzz run with a sequence of transactions as input. During mutation, parts of this sequence are mutated, requiring **re-execution of all previous transactions** to return to a previous state. For exploring programs with deeper states (requiring several transactions to build up), re-execution cost grows linearly.
+
+2. **Lack of State Feedback**: Existing tools only have feedback mechanisms for transactions but not for states. However, states and transactions have different exploration difficulties. The interestingness of states is equally important as transactions for stateful fuzzing, yet such feedback mechanisms to choose interesting states to explore are non-existent in current stateful fuzzing tools.
+
+3. **On-Chain Testing Requirements**: On-chain auditing requires **second-level response time** because:
+   - The state of the blockchain is constantly changing
+   - Attacker exploits can happen at any time
+   - The goal is to pause the contract before attackers identify or conduct attacks
+   
+   Existing fuzzers are not efficient enough to fetch states from the blockchain and finish auditing quickly.
+
+### Snapshot-Based Fuzzing
+
+Instead of re-executing inputs to build up previous states, ItyFuzz proposes **snapshot-based fuzzing**:
+
+**Snapshots** are essentially replicas of intermediate states built from some transactions. By storing all interesting snapshots into a **state corpus** (called "infant state corpus" in the implementation), ItyFuzz can "time travel" to previous states with **constant complexity O(1)**.
+
+**Key Benefits**:
+- **Efficient State Exploration**: Time traveling allows for efficient exploration of the search space of both transactions and states
+- **Fast Snapshotting**: The EVM implementation is refactored to support fast snapshot creation
+- **No Re-execution**: Mutations can start from any saved state without re-executing previous transactions
+
+### Waypoint Mechanisms: Feedback for States
+
+To prioritize exploration of the most interesting states and reduce memory usage (as storing all snapshots would be impractical), ItyFuzz designs **two feedback mechanisms** (called "waypoints") to classify interesting states:
+
+#### 1. Dataflow Waypoint (DataflowFeedback)
+
+Identifies states with more potential momentum by tracking storage read/write patterns:
+- Maintains a global write map that ORs all write maps from each execution
+- Tracks which storage slots are read
+- A state is interesting if a written slot is later read with a new value
+- This indicates the state has "momentum" - it's likely to lead to interesting behaviors
+
+#### 2. Comparison Waypoint (CmpFeedback)
+
+Prunes the space of states by tracking comparison distances:
+- For each comparison encountered (e.g., `if (balance > threshold)`), calculates the absolute difference (distance) between operands
+- Smaller distance means operands are closer, making the comparison more likely to be true
+- Maintains a minimum distance map for each comparison
+- If current distance is smaller than the minimum → state is interesting
+- Uses a votable scheduler to vote on whether the VM state is interesting
+
+**Why Waypoints Matter**: These mechanisms allow ItyFuzz to:
+- **Prioritize Exploration**: Focus on states that are more likely to lead to bugs
+- **Reduce Memory**: Prune uninteresting states when the corpus grows too large
+- **Improve Coverage**: Guide the fuzzer toward states that enable deeper exploration
+
+### On-Chain Testing Support
+
+By reducing overhead from re-execution and improving feedback mechanisms, ItyFuzz achieves **second-level response time**, enabling:
+
+1. **Real-Time On-Chain Auditing**: Test deployed contracts directly on the blockchain
+2. **Dynamic State Fetching**: Pull external contract data from the blockchain in real-time
+3. **State-Specific Code Paths**: Reach code locations that are only accessible from specific on-chain states
+
+**Performance**: The paper reports that ItyFuzz can achieve high coverage over code and states of smart contracts in just a few seconds, making it practical for on-chain testing scenarios.
+
+### Comparison with Existing Approaches
+
+Traditional fuzzers (like Harvey, ContractFuzzer) face these limitations that ItyFuzz addresses:
+
+| Aspect | Traditional Fuzzers | ItyFuzz |
+|--------|-------------------|---------|
+| **State Management** | Re-execute transaction sequences | Snapshot-based O(1) time travel |
+| **State Feedback** | None | Dataflow + Comparison waypoints |
+| **On-Chain Testing** | Too slow (hours/days) | Second-level response time |
+| **Memory Efficiency** | Store transaction sequences | Prune states using waypoints |
+
+### Implementation in Code
+
+These innovations map to the codebase as follows:
+
+- **Snapshots** → `StagedVMState` stored in `InfantStateState` corpus
+- **Dataflow Waypoint** → `DataflowFeedback` in `src/feedback.rs`
+- **Comparison Waypoint** → `CmpFeedback` in `src/feedback.rs`
+- **State Corpus** → `infant_states_state` in `FuzzState`
+- **On-Chain Support** → `OnChain` middleware in `src/evm/onchain/`
+
+The paper demonstrates that ItyFuzz outperforms existing fuzzers in terms of instruction coverage and can find and generate realistic exploits for on-chain projects quickly.
+
 ## Introduction to LibAFL
 
 ### Core Concepts
@@ -537,4 +626,5 @@ When an oracle detects a vulnerability, ItyFuzz creates a **Solution** - a minim
 - **Voting System**: States/inputs get votes based on interestingness
 - **Two Corpora**: Separate storage for transactions vs. VM states
 - **Staged Execution**: Transactions can be incomplete, requiring post-execution steps
+
 
