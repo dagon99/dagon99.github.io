@@ -4,8 +4,6 @@ title: "Ityfuzz Design Summary"
 date: 2025-12-11
 ---
 
-# ItyFuzz Design Summary
-
 ## Overview
 
 ItyFuzz is a feedback-driven fuzzer for smart contract VMs (primarily EVM) built on top of LibAFL. Instead of fuzzing traditional programs, ItyFuzz fuzzes **EVM transactions** to discover vulnerabilities in smart contracts. The key innovation is using **VM-level coverage** (jump/branch coverage within the VM execution) rather than program instruction coverage, combined with specialized feedback mechanisms for smart contract vulnerability detection.
