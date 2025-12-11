@@ -274,6 +274,242 @@ The EVM implementation (`src/evm/`) provides:
 - Initializes corpus from contracts
 - Starts the fuzzing loop via `ItyFuzzer::fuzz_loop()`
 
+## Deep Dive: Key Concepts for Security Researchers
+
+### EVM Coverage Handling and JMP_MAP Feedback
+
+**Coverage Maps**: ItyFuzz uses static arrays (4096 elements) to track execution coverage at the VM level. Unlike traditional fuzzers that track instruction coverage, ItyFuzz tracks:
+
+- **`JMP_MAP`** (Jump Map): The primary coverage mechanism. Tracks which jump/branch edges have been executed.
+- **`READ_MAP`**: Tracks which storage slots have been read.
+- **`WRITE_MAP`**: Tracks which storage slots have been written.
+- **`CMP_MAP`**: Tracks comparison operand distances (for comparison-guided fuzzing).
+
+**How JMP_MAP Works**:
+
+1. **During Execution**: When a `JUMPI` (conditional jump) opcode is executed in the EVM:
+   - The program counter (PC) and jump destination are used to compute a hash: `idx = (PC * jump_dest) % MAP_SIZE`
+   - The corresponding `JMP_MAP[idx]` is incremented (saturating add)
+   - This creates a coverage "edge" representing the (PC, destination) pair
+
+2. **Why JMP_MAP Instead of Instruction Coverage**:
+   - **Branch Coverage**: JMP_MAP tracks which branches are taken, not just which instructions execute. This is more valuable for finding bugs as bugs often hide in specific branch paths.
+   - **Efficiency**: A 4096-byte array is extremely fast to update and check, with minimal memory overhead.
+   - **VM-Level Abstraction**: Works across all contracts in a transaction, not per-contract, making it suitable for multi-contract interactions.
+
+3. **Feedback Mechanism**:
+   - After execution, `MaxMapFeedback` (from LibAFL) checks if any `JMP_MAP[idx]` transitioned from 0 to non-zero
+   - If new coverage is found → the input is marked as "interesting" and added to the transaction corpus
+   - The coverage map is cleared between executions (it's volatile, as per LibAFL's Observer concept)
+
+4. **Coverage Middleware**: The `Coverage` middleware also tracks instruction-level and branch-level coverage per contract for detailed reporting, but this is separate from the JMP_MAP used for feedback.
+
+**Example**: If a contract has `if (balance > 100) { ... }`, the JMP_MAP will track whether the branch was taken (balance > 100) or not (balance <= 100). The fuzzer will try to explore both paths by mutating inputs to satisfy both conditions.
+
+### On-Chain Fuzzing
+
+On-chain fuzzing allows ItyFuzz to fuzz **deployed contracts** on real blockchains (Mainnet, Arbitrum, etc.) rather than just local bytecode.
+
+**How It Works**:
+
+1. **OnChain Middleware**: When enabled, the `OnChain` middleware intercepts EVM opcodes during execution:
+   - **SLOAD (0x54)**: When a storage slot is read, fetches the actual value from the blockchain RPC
+   - **CALL/CALLCODE/DELEGATECALL/STATICCALL**: When a contract is called, fetches the actual bytecode from the blockchain
+   - **EXTCODESIZE/EXTCODECOPY/EXTCODEHASH**: Fetches contract code on-demand
+   - **BALANCE (0x31)**: Fetches actual account balances
+   - **TIMESTAMP (0x42)**: Uses real block timestamps
+   - **CHAINID (0x46)**: Uses the actual chain ID
+
+2. **Storage Fetching Modes**:
+   - **`Dump`**: Fetches all storage slots at once (faster but more RPC calls)
+   - **`OneByOne`**: Fetches storage slots on-demand as they're accessed (slower but fewer initial calls)
+
+3. **Caching**: The middleware caches:
+   - Contract bytecode (by address)
+   - Storage slots (by address + slot)
+   - ABIs (decompiled from bytecode using evmole)
+   - To avoid redundant RPC calls
+
+4. **Use Cases**:
+   - **Fuzzing Production Contracts**: Test deployed contracts with their real on-chain state
+   - **Integration Testing**: Fuzz contracts that interact with other on-chain protocols (Uniswap, Aave, etc.)
+   - **State-Aware Fuzzing**: Explore contracts in their actual deployed state, not just initial state
+
+5. **Limitations**:
+   - Requires RPC endpoint access (Infura, Alchemy, etc.)
+   - Slower than local fuzzing due to network latency
+   - May hit RPC rate limits
+   - Some addresses are blacklisted (e.g., problematic contracts)
+
+**Example**: When fuzzing a DeFi protocol, the OnChain middleware will fetch real token balances, pool reserves, and contract code from the blockchain, allowing the fuzzer to explore realistic interaction scenarios.
+
+### Feedback Stages: Infant, Coverage, and Oracle
+
+ItyFuzz uses a **three-stage feedback system** that evaluates executions at different levels:
+
+#### 1. Infant Feedback (State-Level)
+
+**Purpose**: Determines if a VM state is interesting for further exploration, independent of coverage.
+
+**When Evaluated**: After every execution, before coverage and oracle feedback.
+
+**How It Works**:
+- **CmpFeedback**: Tracks comparison distances in `CMP_MAP`
+  - For each comparison (e.g., `if (balance > threshold)`), records the distance between operands
+  - If a comparison gets "closer" (smaller distance), the state is interesting
+  - Votes for the state in the infant scheduler
+  - Example: If `threshold = 100` and `balance = 150`, distance is 50. If next execution has `balance = 120`, distance is 20 → interesting!
+
+- **State Change Detection**: If the VM state changed (storage modified) or has post-execution, the state is interesting
+
+- **Known State Filtering**: Maintains a hash set of seen states to avoid re-exploring identical states
+
+**Result**: If interesting, the VM state is added to the **Infant State Corpus** for future mutation starting points.
+
+**Why "Infant"**: These states are "infant" (newly discovered) and may lead to interesting paths if explored further.
+
+#### 2. Coverage Feedback (Input-Level)
+
+**Purpose**: Determines if an input (transaction) achieved new code coverage.
+
+**When Evaluated**: After infant feedback, only if execution didn't find a solution.
+
+**How It Works**:
+- Uses `MaxMapFeedback` from LibAFL
+- Checks if `JMP_MAP` has any new non-zero entries compared to previous executions
+- If new coverage → input is interesting
+
+**Result**: If interesting, the input is added to the **Transaction Corpus** for future mutations.
+
+**Note**: Coverage feedback is evaluated on the **input**, not the state. Multiple inputs can reach the same state, but only inputs with new coverage are kept.
+
+#### 3. Oracle Feedback (Solution Detection)
+
+**Purpose**: Detects actual vulnerabilities (solutions).
+
+**When Evaluated**: After every non-reverted execution, in parallel with infant feedback.
+
+**How It Works**:
+- Executes all registered oracles (ReentrancyOracle, ArbitraryTransferOracle, etc.)
+- Each oracle analyzes the execution context and checks for vulnerability patterns
+- If any oracle finds a bug → returns `true`
+
+**Result**: If interesting (vulnerability found):
+- Input is added to the **Solutions Corpus** (not regular corpus)
+- Bug is reported via `ORACLE_OUTPUT`
+- Input is minimized to create a minimal reproduction case
+- Fuzzer can exit (unless `RUN_FOREVER` is set)
+
+**Priority**: Oracle feedback takes precedence. If a solution is found, coverage feedback is skipped.
+
+**Execution Order** (from `evaluate_input_events` in `fuzzer.rs`):
+```
+1. Execute transaction
+2. Infant Feedback → Add to infant corpus if interesting
+3. Oracle Feedback → Check for vulnerabilities
+4. If no solution:
+   5. Coverage Feedback → Add to transaction corpus if new coverage
+```
+
+### Presets and Exploit Templates
+
+Presets are **exploit templates** that guide the fuzzer to explore specific attack patterns or function call sequences.
+
+**What Are Presets**:
+
+- **ExploitTemplate**: A JSON structure defining:
+  - `exploit_name`: Name of the exploit pattern
+  - `function_sigs`: Required function signatures that must exist in contracts
+  - `calls`: Function signatures to call in sequence
+
+**How They Work**:
+
+1. **Template Matching**: During corpus initialization (`evm_fuzzer.rs`):
+   - Loads exploit templates from a JSON file
+   - Matches templates against deployed contracts by checking if all `function_sigs` exist
+   - Creates a mapping: `function_sig → (address, ABI)`
+
+2. **State Initialization**: If templates match:
+   - `state.init_presets()` stores matched templates and the sig-to-address mapping
+   - `interesting_signatures` list is populated with function signatures to prioritize
+
+3. **Mutation Guidance**: During mutation:
+   - `state.has_preset()` checks if presets are available
+   - `state.get_next_call()` randomly selects a function signature from `interesting_signatures`
+   - Mutator can use this to guide transaction generation toward exploit patterns
+
+4. **Example Preset** (`pair.rs`):
+   ```rust
+   // For Uniswap V2 pair exploits
+   // Function sig: 0xbc25cf77 (some pair function)
+   // When this function is called, preset modifies the input
+   // to call it 37 times (repeat = 37)
+   ```
+
+**Use Cases**:
+- **Known Exploit Patterns**: Guide fuzzer to explore known vulnerability patterns (reentrancy, flashloan attacks, etc.)
+- **Protocol-Specific**: Target specific DeFi protocols (Uniswap, Aave) with known interaction patterns
+- **Research**: Test hypotheses about exploit sequences
+
+**Limitations**:
+- Requires knowing function signatures in advance
+- Only guides mutation, doesn't guarantee finding exploits
+- Must be enabled via `use_presets` feature flag
+
+**File Format** (JSON):
+```json
+[
+  {
+    "exploit_name": "Uniswap V2 Pair Exploit",
+    "function_sigs": ["0xbc25cf77"],
+    "calls": ["0xbc25cf77"]
+  }
+]
+```
+
+### Solutions: Vulnerability Reporting and Minimization
+
+When an oracle detects a vulnerability, ItyFuzz creates a **Solution** - a minimal, reproducible test case.
+
+**Solution Creation Process**:
+
+1. **Detection**: Oracle returns a `bug_idx` indicating a vulnerability was found
+
+2. **Registration**: 
+   - Bug is registered in `BugMetadata` with the corpus index
+   - `EVMBugResult` is created with:
+     - `bug_type`: Type of vulnerability (e.g., "Reentrancy", "ArbitraryTransfer")
+     - `bug_info`: Human-readable description
+     - `input`: The concise input that triggered the bug
+     - `bug_idx`: Unique identifier
+     - `sourcemap`: Optional source code mapping
+
+3. **Minimization**: `SequentialMinimizer` reduces the input to a minimal reproduction:
+   - Removes unnecessary transactions
+   - Simplifies transaction parameters
+   - Keeps only the essential sequence that triggers the bug
+
+4. **Output Generation**:
+   - **Console**: Prints bug description and transaction trace
+   - **JSON**: Writes to `vuln_info.jsonl` with all bug details
+   - **Foundry Test**: Generates a Foundry test file (`.t.sol`) that can be run to reproduce the bug
+   - **Replayable Format**: Saves concise input format for replay
+
+5. **Test File Generation** (`solution/mod.rs`):
+   - Uses Handlebars template (`foundry_test.hbs`)
+   - Generates a complete Foundry test with:
+     - Setup code (forking blockchain if on-chain)
+     - Transaction sequence
+     - Assertions
+     - Can be run directly with `forge test`
+
+**Solution Corpus**: Solutions are stored separately from the regular corpus in `OnDiskCorpus` at the `solutions/` directory.
+
+**Why Solutions Matter**:
+- **Reproducibility**: Minimal test cases can be shared and verified
+- **Integration**: Foundry tests can be added to test suites
+- **Documentation**: Clear evidence of vulnerabilities for bug reports
+
 ## For Developers
 
 ### Where to Start
@@ -301,5 +537,4 @@ The EVM implementation (`src/evm/`) provides:
 - **Voting System**: States/inputs get votes based on interestingness
 - **Two Corpora**: Separate storage for transactions vs. VM states
 - **Staged Execution**: Transactions can be incomplete, requiring post-execution steps
-
 
